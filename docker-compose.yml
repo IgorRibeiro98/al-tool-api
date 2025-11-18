@@ -1,0 +1,30 @@
+services:
+  python:
+    image: python:latest
+    container_name: al_tool_python
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    command: >-
+      bash -c "pip install --upgrade pip && \
+      if [ -f requirements.txt ]; then pip install -r requirements.txt; fi && \
+      uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    networks:
+      - al-tool-net
+
+networks:
+  al-tool-net:
+    external: true
+    # Para adicionar dependências futuras (ex: banco), crie novos serviços.
+
+# Uso básico:
+# docker compose up -d --build
+# Acessar: http://localhost:8000/
+# Docs: http://localhost:8000/docs
+# Entrar no container: docker compose exec app bash

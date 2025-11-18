@@ -1,0 +1,70 @@
+# Arquivos de cache e compilados
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ambientes virtuais
+venv/
+.env
+.env*/
+.env.*
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+.direnv/
+.envrc
+
+# Dependências e distribuição
+build/
+dist/
+downloads/
+.eggs/
+.eggs/
+*.egg-info/
+*.egg
+wheels/
+*.whl
+MANIFEST
+__pypackages__/
+
+# Testes e cobertura
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+htmlcov/
+.hypothesis/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+.tox/
+.nox/
+
+# Logs
+*.log
+logs/
+log/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Documentação
+docs/_build/
+
+# Ferramentas / IDE
+.vscode/
+.idea/
+*.swp
+*~
+.project
+.pydevproject
+
+# Outros
+.DS_Store
+Thumbs.db
+.scrapy/
+instance/
+target/
