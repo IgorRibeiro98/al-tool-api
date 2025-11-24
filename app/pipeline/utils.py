@@ -1,24 +1,31 @@
 """Pipeline utilities.
 
-Contains helpers used across pipeline steps.
+Contém helpers usados em vários passos da pipeline:
+- infer_column_types
+- build_key / generate_keys
+- filter_concilable
+- invert_value
+- group_by_key
+- classify
+- find_missing_keys
+- attach_results
 """
 from __future__ import annotations
 
-from typing import Dict, Any, List, Union
-from typing import Tuple
+from typing import Any, Dict, List, Tuple, Union
 
 import pandas as pd
 from pandas.api import types as pdtypes
 
 
+# ---------------------------------------------------------------------------
+# Inferência simples de tipos de coluna
+# ---------------------------------------------------------------------------
+
 def infer_column_types(df: pd.DataFrame) -> Dict[str, str]:
-    """Infer simple column types for a DataFrame.
+    """Inferir tipo simples por coluna.
 
-    For each column returns one of: 'number', 'date', 'string'.
-
-    - 'number' if the column has a numeric dtype
-    - 'date' if the column has a datetime/timedelta dtype
-    - 'string' otherwise
+    Retorna um dict col -> {'number','date','string'}.
     """
     types: Dict[str, str] = {}
     for col in df.columns:
@@ -32,131 +39,93 @@ def infer_column_types(df: pd.DataFrame) -> Dict[str, str]:
     return types
 
 
+# ---------------------------------------------------------------------------
+# Construção de chaves
+# ---------------------------------------------------------------------------
+
 def build_key(row: Union[pd.Series, Dict[str, Any]], columns: List[str], sep: str = "|") -> str:
-    """Build a composite key from `row` by concatenating the values of `columns`.
-
-    - `row` may be a `pandas.Series` or a `dict`-like object.
-    - `columns` is a list of column names to include in order.
-    - `sep` is the separator used between values (default: `"|"`).
-
-    Missing or NaN values are treated as empty strings.
-    """
+    """Monta uma chave composta a partir de um row e uma lista de colunas."""
     parts: List[str] = []
     for col in columns:
         value = None
         try:
             value = row[col]
         except Exception:
-            # fallback for dict-like objects
             if isinstance(row, dict):
                 value = row.get(col)
             else:
-                # last resort: attempt attribute access
                 value = getattr(row, col, None)
-        # normalize pandas NA
+
         try:
             if pd.isna(value):
                 parts.append("")
                 continue
         except Exception:
             pass
-        parts.append("" if value is None else str(value))
 
+        parts.append("" if value is None else str(value))
     return sep.join(parts)
 
 
-__all__ = ["infer_column_types", "build_key"]
-
-
 def generate_keys(df: pd.DataFrame, columns: List[str], sep: str = "|") -> pd.Series:
-    """Generate a pandas Series of composite keys for each row in `df`.
+    """Gera uma Series de chaves compostas para cada linha de `df`.
 
-    - `columns` is a list of column names (order matters).
-    - `sep` is the separator used between values (default: `"|"`).
-
-    Missing columns are treated as empty strings. NaN values are treated as
-    empty strings as well. The returned Series has the same index as `df`.
+    - `columns`: lista de nomes de colunas (ordem importa).
+    - Colunas ausentes são tratadas como vazias.
+    - NaN é tratado como string vazia.
+    - Retorna uma Series 1-D alinhada ao índice de `df`.
     """
-    # If columns list is empty, return empty strings
     if not columns:
         return pd.Series([""] * len(df), index=df.index)
 
-    # Garantir que `columns` é lista de strings
+    # Garante que são strings
     columns = [str(c) for c in columns]
 
-    # Não mutar o df original: criamos um df “seguro” só com as colunas relevantes
-    existing = [c for c in columns if c in df.columns]
-    missing = [c for c in columns if c not in df.columns]
-
-    # Reindexa colunas existentes, preenchendo com NaN onde não houver
+    # Não mutar df original
     safe_df = df.copy()
-    for c in missing:
-        # cria coluna ausente com None/NaN
-        safe_df[c] = None
 
-    # Garante a ordem das colunas conforme `columns`
+    # Cria colunas ausentes como None
+    for c in columns:
+        if c not in safe_df.columns:
+            safe_df[c] = None
+
+    # Garante ordem exata
     safe_df = safe_df[columns]
 
-    # Replace NA with empty string and convert to string, then join per row
-    safe = safe_df.applymap(lambda x: "" if pd.isna(x) else str(x))
+    # Substitui NA por "" e converte tudo para string
+    safe_df = safe_df.fillna("").astype(str)
 
-    key_series = safe.agg(sep.join, axis=1)
+    key_series = safe_df.agg(sep.join, axis=1)
 
-    # Garantir que é Series 1-D alinhada ao índice original
     if not isinstance(key_series, pd.Series):
         key_series = pd.Series(list(key_series), index=df.index)
 
     return key_series
 
-    """Generate a pandas Series of composite keys for each row in `df`.
 
-    - `columns` is a list of column names (order matters).
-    - `sep` is the separator used between values (default: `"|"`).
-
-    Missing columns are treated as empty strings. NaN values are treated as
-    empty strings as well. The returned Series has the same index as `df`.
-    """
-    # If columns list is empty, return empty strings
-    if not columns:
-        return pd.Series([""] * len(df), index=df.index)
-
-    # Ensure missing columns exist in df (as None)
-    missing = [c for c in columns if c not in df.columns]
-    if missing:
-        for c in missing:
-            df[c] = None
-
-    # Replace NA with empty string and convert to string, then join per row
-    safe = df[columns].applymap(lambda x: "" if pd.isna(x) else str(x))
-    return safe.agg(sep.join, axis=1)
-
+# ---------------------------------------------------------------------------
+# Filtro de linhas conciliáveis (remove estornos e canceladas)
+# ---------------------------------------------------------------------------
 
 def filter_concilable(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a DataFrame filtered to rows eligible for reconciliation.
+    """Filtra DataFrame para linhas elegíveis à conciliação.
 
-    Removes rows marked as reversals (`__is_reversal__`) or cancelled
-    (`__is_canceled__`). If those marker columns are missing they are
-    treated as `False` (i.e. rows are kept).
-
-    The original DataFrame is not modified; a filtered copy is returned.
+    Remove:
+    - linhas marcadas como reversals (`__is_reversal__`)
+    - linhas marcadas como canceladas (`__is_canceled__`)
     """
     if df is None:
         return df
 
-    # work on a view but avoid mutating original
     series_index = df.index
 
     def _truthy_series(s: pd.Series) -> pd.Series:
-        # normalize different representations into boolean Series
         if s is None:
             return pd.Series([False] * len(df), index=series_index)
-        # boolean dtype -> straightforward
         if pd.api.types.is_bool_dtype(s):
             return s.fillna(False)
-        # numeric dtype -> non-zero is truthy
         if pd.api.types.is_numeric_dtype(s):
             return s.fillna(0).astype(bool)
-        # otherwise try to coerce strings like 'true','1','yes'
         return s.fillna("").astype(str).str.lower().isin({"1", "true", "yes", "y", "t"})
 
     mask = pd.Series([True] * len(df), index=series_index)
@@ -168,67 +137,51 @@ def filter_concilable(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[mask].copy()
 
 
-__all__ = ["infer_column_types", "build_key", "generate_keys", "filter_concilable"]
-
-
 def invert_value(df: pd.DataFrame, column: str) -> pd.DataFrame:
-        """Return a DataFrame where `column` values are multiplied by -1.
-
-        - Does not modify the original DataFrame; returns a copy.
-        - Non-numeric values are coerced to numeric where possible; values that
-            cannot be converted become `NaN` and remain unchanged except for the
-            coercion.
-        - Raises `KeyError` if `column` is not present in `df`.
-        """
-        if column not in df.columns:
-                raise KeyError(f"Column not found: {column}")
-
-        out = df.copy()
-        # coerce to numeric where possible; keep NaN for non-coercible
-        coerced = pd.to_numeric(out[column], errors="coerce")
-        out[column] = -1 * coerced
-        return out
+    """Retorna uma cópia do DataFrame com a coluna multiplicada por -1."""
+    if column not in df.columns:
+        raise KeyError(f"Column not found: {column}")
+    out = df.copy()
+    coerced = pd.to_numeric(out[column], errors="coerce")
+    out[column] = -1 * coerced
+    return out
 
 
-__all__ = ["infer_column_types", "build_key", "generate_keys", "filter_concilable", "invert_value"]
+# ---------------------------------------------------------------------------
+# Agrupamento por chave (núcleo da conciliação)
+# ---------------------------------------------------------------------------
 
+def group_by_key(
+    df: pd.DataFrame,
+    key_series: Union[pd.Series, List[Any]],
+    value_column: str,
+) -> Dict[Any, float]:
+    """Agrupa `df` por `key_series` e soma `value_column`.
 
-def group_by_key(df: pd.DataFrame, key_series: Union[pd.Series, List[Any]], value_column: str) -> Dict[Any, float]:
-    """Group `df` by `key_series` and sum `value_column`.
+    - `key_series`: Series ou iterável com mesmo length de df.
+    - `value_column`: deve existir em df.
 
-    - `key_series` can be a `pandas.Series` aligned with `df`, or a list/array
-      with the same length as `df`.
-    - `value_column` must exist in `df`.
-
-    Returns a dict mapping key -> summed numeric value (float). Non-numeric
-    values in `value_column` are coerced to numeric; non-convertible values
-    are treated as 0.
+    Retorna dict key -> soma(float).
     """
     if value_column not in df.columns:
-        # Include sample of available columns to aid debugging.
         cols_preview = ", ".join(list(map(str, df.columns))[:25])
         raise KeyError(
             f"Value column not found: {value_column}. "
             f"Available columns ({len(df.columns)}): {cols_preview}"
         )
 
-    # normalize key_series to a Series aligned with df.index
+    # 1) Normalizar key_series para Series 1-D alinhada com df.index
     try:
         if isinstance(key_series, pd.Series):
             ks = key_series.reindex(df.index)
         else:
-            # assume list-like
             if len(key_series) != len(df):
                 raise ValueError(f"key_series length mismatch: {len(key_series)} != {len(df)}")
             ks = pd.Series(list(key_series), index=df.index)
     except Exception as e:
         raise ValueError(f"Failed to normalize key_series: {e}") from e
 
-    # ensure ks is 1-D
-    if getattr(ks, "ndim", 1) != 1:
-        raise ValueError("key_series must be 1-D after normalization")
-
-    # guard against non-hashable entries (convert to string; tratar None/NaN)
+    # Garante 1-D e string (tratando None/NaN como vazio)
     try:
         ks = ks.apply(
             lambda x: "" if (x is None or (isinstance(x, float) and pd.isna(x))) else str(x)
@@ -236,8 +189,38 @@ def group_by_key(df: pd.DataFrame, key_series: Union[pd.Series, List[Any]], valu
     except Exception:
         ks = ks.astype(str)
 
-    # sanitize value column: if cells are list/tuple/dict, attempt to extract a numeric scalar
+    # 2) Sanitizar valores da coluna de valor
     raw_vals = df[value_column].copy()
+
+    # Se a seleção por `value_column` retornou múltiplas colunas (DataFrame)
+    # — por exemplo quando há nomes de coluna duplicados — reduza para uma
+    # Series antes de aplicar conversões. Heurística:
+    # - se maioria/total das colunas for numérica, soma-se por linha;
+    # - caso contrário, escolhe-se o primeiro valor não-nulo por linha.
+    if isinstance(raw_vals, pd.DataFrame):
+        try:
+            is_num = [pd.api.types.is_numeric_dtype(raw_vals[c]) for c in raw_vals.columns]
+            if len(is_num) > 0 and (all(is_num) or sum(is_num) >= (len(is_num) / 2)):
+                # converte cada coluna para numérico e soma por linha (NaN -> 0)
+                raw_vals = raw_vals.apply(lambda col: pd.to_numeric(col, errors="coerce").fillna(0))
+                raw_vals = raw_vals.sum(axis=1)
+            else:
+                def _first_nonnull(row):
+                    for v in row:
+                        try:
+                            if not pd.isna(v):
+                                return v
+                        except Exception:
+                            if v is not None:
+                                return v
+                    return None
+
+                raw_vals = raw_vals.apply(_first_nonnull, axis=1)
+        except Exception:
+            try:
+                raw_vals = raw_vals.iloc[:, 0]
+            except Exception:
+                raw_vals = pd.Series([None] * len(df), index=df.index)
 
     def _extract_scalar(v: Any) -> Any:
         if v is None:
@@ -265,7 +248,6 @@ def group_by_key(df: pd.DataFrame, key_series: Union[pd.Series, List[Any]], valu
     except Exception:
         pass
 
-    # optional normalization of numeric-looking strings (handles decimal comma & thousands separators)
     def _normalize_numeric_string(s: Any) -> Any:
         if s is None:
             return None
@@ -276,39 +258,27 @@ def group_by_key(df: pd.DataFrame, key_series: Union[pd.Series, List[Any]], valu
         t = s.strip()
         if t == "":
             return None
-        # handle negative in parentheses e.g. (1.234,56)
         neg = False
         if t.startswith("(") and t.endswith(")"):
             neg = True
             t = t[1:-1].strip()
-        # remove currency symbols and spaces
         for sym in ["R$", "$", "€", "£"]:
-            if sym in t:
-                t = t.replace(sym, "")
+            t = t.replace(sym, "")
         t = t.replace(" ", "")
-        # unify thousand/decimal separators
         if "," in t and "." in t:
             last_comma = t.rfind(",")
             last_dot = t.rfind(".")
             if last_comma > last_dot:
-                # pattern like 1.234,56
-                t = t.replace(".", "")
-                t = t.replace(",", ".")
+                t = t.replace(".", "").replace(",", ".")
             else:
-                # pattern like 1,234.56
                 t = t.replace(",", "")
         elif "," in t and "." not in t:
-            # decimal comma
             if t.count(",") == 1:
                 t = t.replace(",", ".")
             else:
-                # multiple commas -> thousands
                 t = t.replace(",", "")
-        elif "." in t and "," not in t:
-            # could be decimal point or thousands; if more than one dot treat as thousands
-            if t.count(".") > 1:
-                t = t.replace(".", "")
-        # remove any trailing non-numeric chars (e.g. '%', ';', ',', '.')
+        elif "." in t and "," not in t and t.count(".") > 1:
+            t = t.replace(".", "")
         while t and t[-1] in ["%", ";", ":", ",", "."]:
             t = t[:-1]
         if neg:
@@ -316,51 +286,34 @@ def group_by_key(df: pd.DataFrame, key_series: Union[pd.Series, List[Any]], valu
         return t
 
     try:
-        # apply only if many strings present
         ser_strings = raw_vals.apply(lambda x: isinstance(x, str))
         if ser_strings.sum() > 0 and (ser_strings.sum() / max(len(raw_vals), 1)) >= 0.3:
             raw_vals = raw_vals.apply(_normalize_numeric_string)
     except Exception:
         pass
 
-    # Agora garantimos que vals é uma Series 1-D
     vals = pd.to_numeric(raw_vals, errors="coerce").fillna(0)
 
-    # Construímos um DataFrame auxiliar para evitar problemas com `by` do groupby
-    tmp = pd.DataFrame({"__key__": ks, "__value__": vals})
+    # 3) Agregação manual (sem usar groupby)
+    agg: Dict[Any, float] = {}
+    for k, v in zip(ks.values, vals.values):
+        try:
+            fv = float(v)
+        except Exception:
+            fv = 0.0
+        agg[k] = agg.get(k, 0.0) + fv
 
-    try:
-        grouped = tmp.groupby("__key__")["__value__"].sum()
-    except Exception as e:
-        sample_vals = raw_vals.head(5).tolist()
-        sample_keys = ks.head(5).tolist()
-        raise RuntimeError(
-            f"GroupBy failed (value_column={value_column}, rows={len(df)}, "
-            f"unique_keys={ks.nunique()}, sample_keys={sample_keys}, "
-            f"sample_values={sample_vals}): {e}"
-        ) from e
-
-    # convert to plain Python dict (keys may be numpy types)
-    return {k: float(v) for k, v in grouped.items()}
+    return agg
 
 
-__all__ = ["infer_column_types", "build_key", "generate_keys", "filter_concilable", "invert_value", "group_by_key"]
 
+
+# ---------------------------------------------------------------------------
+# Classificação A x B e chaves faltantes
+# ---------------------------------------------------------------------------
 
 def classify(valueA: Any, valueB: Any, threshold: float = 0.0) -> Tuple[str, str, float]:
-    """Classify two numeric values for reconciliation.
-
-    Returns a tuple `(status, group, difference)` where:
-    - `status` is a short string describing the relation: one of
-      `"both_zero"`, `"match"`, `"only_a"`, `"only_b"`, `"mismatch"`.
-    - `group` is a coarser classification: `"matched"` or `"unmatched"`.
-    - `difference` is `valueA - valueB` (float), where missing/non-numeric
-      inputs are treated as `0.0` for the arithmetic.
-
-    `threshold` is a non-negative tolerance: if `abs(difference) <= threshold`
-    the pair is considered a `match`.
-    """
-    # coerce to numeric where possible; treat non-convertible as NaN
+    """Classifica dois valores numéricos para conciliação."""
     try:
         a = float(valueA)
     except Exception:
@@ -370,7 +323,6 @@ def classify(valueA: Any, valueB: Any, threshold: float = 0.0) -> Tuple[str, str
     except Exception:
         b = float("nan")
 
-    # treat NaN as 0.0 for reconciliation arithmetic
     ai = 0.0 if pd.isna(a) else a
     bi = 0.0 if pd.isna(b) else b
     diff = float(ai - bi)
@@ -388,14 +340,7 @@ def classify(valueA: Any, valueB: Any, threshold: float = 0.0) -> Tuple[str, str
 
 
 def find_missing_keys(keysA: List[Any], keysB: List[Any]) -> Tuple[List[Any], List[Any]]:
-    """Return (onlyA, onlyB) where:
-
-    - `onlyA` are keys present in `keysA` but not in `keysB`.
-    - `onlyB` are keys present in `keysB` but not in `keysA`.
-
-    Inputs can be any iterable of hashable values. The returned lists are
-    sorted to provide deterministic ordering.
-    """
+    """Retorna (onlyA, onlyB) para chaves presentes só em uma das listas."""
     setA = set(keysA or [])
     setB = set(keysB or [])
 
@@ -404,17 +349,9 @@ def find_missing_keys(keysA: List[Any], keysB: List[Any]) -> Tuple[List[Any], Li
     return onlyA, onlyB
 
 
-__all__ = [
-    "infer_column_types",
-    "build_key",
-    "generate_keys",
-    "filter_concilable",
-    "invert_value",
-    "group_by_key",
-    "classify",
-    "find_missing_keys",
-]
-
+# ---------------------------------------------------------------------------
+# Anexar resultados por chave em um DF
+# ---------------------------------------------------------------------------
 
 def attach_results(
     df: pd.DataFrame,
@@ -424,27 +361,15 @@ def attach_results(
     group_col: str = "group",
     diff_col: str = "difference",
 ) -> pd.DataFrame:
-    """Attach reconciliation results to `df`.
-
-    Parameters
-    - `df`: DataFrame to annotate (a copy is returned; original not mutated).
-    - `mapping_dict`: mapping from key -> result. Each result can be either:
-        - a tuple/list like `(status, group, difference)` or
-        - a dict with keys `status`, `group`, `difference` (or any subset).
-    - `key_column`: the column in `df` that contains the key used to lookup results.
-    - `status_col`, `group_col`, `diff_col`: names for the output columns to add.
-
-    For rows whose key is not present in `mapping_dict`, the function fills
-    `status_col` and `group_col` with `None` and `diff_col` with `NaN`.
-    """
+    """Anexa colunas de resultado de conciliação em um DataFrame."""
     if key_column not in df.columns:
         raise KeyError(f"Key column not found in DataFrame: {key_column}")
 
     out = df.copy()
 
-    statuses = []
-    groups = []
-    diffs = []
+    statuses: List[Any] = []
+    groups: List[Any] = []
+    diffs: List[float] = []
 
     for k in out[key_column]:
         res = mapping_dict.get(k)
@@ -455,7 +380,6 @@ def attach_results(
             continue
 
         if isinstance(res, (list, tuple)):
-            # expect (status, group, difference)
             st = res[0] if len(res) > 0 else None
             gr = res[1] if len(res) > 1 else None
             dfv = res[2] if len(res) > 2 else float("nan")
@@ -464,7 +388,6 @@ def attach_results(
             gr = res.get("group")
             dfv = res.get("difference", float("nan"))
         else:
-            # unknown shape; store whole object in status for debugging
             st = str(res)
             gr = None
             dfv = float("nan")
@@ -481,3 +404,16 @@ def attach_results(
     out[diff_col] = diffs
 
     return out
+
+
+__all__ = [
+    "infer_column_types",
+    "build_key",
+    "generate_keys",
+    "filter_concilable",
+    "invert_value",
+    "group_by_key",
+    "classify",
+    "find_missing_keys",
+    "attach_results",
+]
