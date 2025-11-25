@@ -12,14 +12,123 @@ from typing import List, Optional
 from ..core.storage import save_file
 from ..core.db import init_db, get_connection
 from ..repo.schema import create_tables
-from ..repo.datasets import create_dataset_record
+from ..repo.datasets import create_dataset_record, ingest_dataset_to_sql
+from ..pipeline.fill_nulls import fill_nulls_sql
+from ..pipeline.cancellation import mark_canceled_sql
+from ..pipeline.reversals import detect_and_mark_reversals_sql
+from ..repo.cancellation_config import get_cancellation_config, get_cancellation_config_by_id
 from ..pipeline.importer import load_fiscal
 from ..pipeline.utils import infer_column_types
 from ..repo.dataset_columns import save_detected_columns
 from ..core.config import settings
 from pathlib import Path
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi import BackgroundTasks
+import uuid
+import logging
+import os
+
+from ..pipeline.exporter import generate_dataset_xlsx
 
 router = APIRouter()
+
+LOG = logging.getLogger(__name__)
+
+
+def _init_db_conn():
+    """Ensure DB initialized and return (conn, cursor).
+
+    Caller is responsible for closing `conn`.
+    """
+    init_db()
+    conn = get_connection()
+    create_tables(conn)
+    cur = conn.cursor()
+    return conn, cur
+
+
+
+@router.post("/datasets/{dataset_id}/export-async")
+def export_dataset_async(dataset_id: int, background: BackgroundTasks):
+    """Start an asynchronous export job for `dataset_id`.
+
+    Returns 202 with a `job_id` and a `status_url`. The background task will
+    generate the XLSX and place it under `storage/exports/export_{dataset_id}_{job_id}.xlsx`.
+    """
+    conn, cur = _init_db_conn()
+    try:
+        job_id = uuid.uuid4().hex
+        out_dir = Path(settings.STORAGE_PATH) / "exports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"export_{dataset_id}_{job_id}.xlsx"
+        out_path = str(out_dir / filename)
+
+        err_path = out_dir / f"export_{dataset_id}_{job_id}.error"
+
+        def _generate_and_write(job_id_inner: str, path: str, ds_id: int, err_marker: str):
+            try:
+                init_db()
+                bg_conn = get_connection()
+                try:
+                    res = generate_dataset_xlsx(bg_conn, ds_id)
+                    src = res.get("path") if isinstance(res, dict) else None
+                    if src and Path(src).exists():
+                        try:
+                            Path(src).rename(path)
+                        except Exception:
+                            # fallback to copy+unlink if rename fails across filesystems
+                            from shutil import copyfile
+
+                            copyfile(src, path)
+                            try:
+                                Path(src).unlink()
+                            except Exception:
+                                pass
+                    else:
+                        # generate_dataset_xlsx did not return a path; mark as error
+                        Path(err_marker).write_text("no output")
+                finally:
+                    try:
+                        bg_conn.close()
+                    except Exception:
+                        pass
+            except Exception:
+                LOG.exception("Export job failed for dataset %s (job %s)", ds_id, job_id_inner)
+                try:
+                    Path(err_marker).write_text("failed")
+                except Exception:
+                    pass
+
+        # schedule background task
+        background.add_task(_generate_and_write, job_id, out_path, int(dataset_id), str(err_path))
+
+        status_url = f"/datasets/{dataset_id}/export/status/{job_id}"
+        return JSONResponse({"job_id": job_id, "status_url": status_url}, status_code=202)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@router.get("/datasets/{dataset_id}/export/status/{job_id}")
+def export_status(dataset_id: int, job_id: str):
+    """Check status of an export job and return the file when ready.
+
+    - 202 Pending: job not finished
+    - 200 FileResponse: file ready for download
+    - 500 Failed: job failed
+    """
+    out_dir = Path(settings.STORAGE_PATH) / "exports"
+    filename = f"export_{dataset_id}_{job_id}.xlsx"
+    path = out_dir / filename
+    err = out_dir / f"export_{dataset_id}_{job_id}.error"
+
+    if path.exists():
+        return FileResponse(str(path), filename=filename, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if err.exists():
+        return JSONResponse({"status": "failed"}, status_code=500)
+    return JSONResponse({"status": "pending"}, status_code=202)
 
 # formatos aceitos ao fazer upload/preview
 ALLOWED_FORMATS = {"csv", "txt", "excel", "xls", "xlsx"}
@@ -32,6 +141,8 @@ async def upload_dataset(
     format: str = Form(...),
     header_row: Optional[int] = Form(None),
     header_col: Optional[str] = Form(None),
+    reversal_config_id: Optional[int] = Form(None),
+    cancellation_config_id: Optional[int] = Form(None),
 ):
     """Receive a dataset file, save it and register a dataset record.
 
@@ -54,13 +165,7 @@ async def upload_dataset(
 
     # Ensure DB file exists and tables are created (schema module contains DDL)
     try:
-        init_db()
-        conn = get_connection()
-        create_tables(conn)
-    except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database initialization error") from exc
-
-    try:
+        conn, cur = _init_db_conn()
         # Persist header_row/header_col directly in datasets table (if migrated)
         dataset_id = create_dataset_record(
             conn,
@@ -72,7 +177,13 @@ async def upload_dataset(
             header_col=header_col if header_col is not None else None,
         )
     except Exception as exc:
+        # Ensure connection closed if created
+        try:
+            conn.close()
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create dataset record") from exc
+
     else:
         # Try to load the saved file and persist detected columns. Do not fail the upload if this step fails.
         try:
@@ -89,6 +200,106 @@ async def upload_dataset(
                         save_detected_columns(conn, dataset_id, df, col_types, header_row=hr or 1, header_col=hc)
                 except Exception:
                     # Don't fail the upload for metadata persistence errors
+                    pass
+
+                # Attempt to ingest DataFrame into dedicated SQL table for this dataset.
+                try:
+                    res = ingest_dataset_to_sql(conn, dataset_id, df)
+                    # update datasets.row_count when ingestion succeeds
+                    try:
+                        cur = conn.cursor()
+                        cur.execute("UPDATE datasets SET row_count = ? WHERE id = ?", (int(res.get("rows", 0)), dataset_id))
+                        conn.commit()
+                    except Exception:
+                        pass
+                except Exception:
+                    # Do not fail the upload if ingestion fails here; ingestion can be retried later.
+                    pass
+                # After successful ingestion, attempt SQL-only preprocessing steps:
+                try:
+                    # build schema_info from dataset_columns table
+                    cur = conn.cursor()
+                    cur.execute("SELECT name, data_type FROM dataset_columns WHERE dataset_id = ? ORDER BY id", (dataset_id,))
+                    rows = cur.fetchall()
+                    schema_info = {r[0]: (r[1] or "string") for r in rows} if rows else {}
+                    if schema_info:
+                        # attempt SQL null-filling; don't fail upload if this fails
+                        try:
+                            fill_nulls_sql(conn, dataset_id, schema_info)
+                        except Exception:
+                            pass
+
+                        # cancellation: apply only when an explicit cancellation_config_id is provided
+                        try:
+                            cfg = None
+                            if cancellation_config_id:
+                                try:
+                                    # look up by id
+                                    from ..repo.cancellation_config import get_cancellation_config_by_id
+
+                                    cfg = get_cancellation_config_by_id(conn, int(cancellation_config_id))
+                                except Exception:
+                                    cfg = None
+
+                            # If a config was resolved, apply cancelation marking via SQL
+                            if cfg:
+                                try:
+                                    mark_canceled_sql(conn, dataset_id, cfg.get("indicator_column"), cfg.get("canceled_value"))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        # reversal detection: apply the provided reversal_config_id or all reversal configs when none specified
+                        try:
+                            rev_rows = []
+                            if reversal_config_id:
+                                cur.execute(
+                                    "SELECT column_a, column_b, value_column FROM reversal_configs WHERE id = ?",
+                                    (int(reversal_config_id),),
+                                )
+                                row = cur.fetchone()
+                                if row:
+                                    rev_rows.append(row)
+                            else:
+                                # apply all global reversal configs
+                                cur.execute("SELECT column_a, column_b, value_column FROM reversal_configs")
+                                rev_rows = cur.fetchall()
+
+                            for ra, rb, rv in (rev_rows or []):
+                                try:
+                                    res = detect_and_mark_reversals_sql(conn, dataset_id, ra, rb, rv)
+                                    # persist a reconciliation_runs + reconciliation_results for this upload's estornos
+                                    try:
+                                        import datetime
+
+                                        started = datetime.datetime.utcnow().isoformat()
+                                        finished = started
+                                        cur.execute(
+                                            "INSERT INTO reconciliation_runs (config_id, status, started_at, finished_at, summary_json) VALUES (?, ?, ?, ?, ?)",
+                                            (None, "completed", started, finished, "{}"),
+                                        )
+                                        conn.commit()
+                                        run_id = cur.lastrowid
+                                        # insert one result per affected row_index
+                                        rows = res.get("rows") or []
+                                        for rid in rows:
+                                            try:
+                                                cur.execute(
+                                                    "INSERT INTO reconciliation_results (run_id, dataset_id, row_identifier, status, group_name, key_used, difference) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                                    (run_id, dataset_id, str(rid), "Conciliado_Estorno", "01_Conciliado", None, 0.0),
+                                                )
+                                            except Exception:
+                                                pass
+                                        conn.commit()
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                except Exception:
+                    # overall: do not fail the upload for preprocessing errors
                     pass
         except Exception:
             # If loading/preprocessing fails, skip persisting columns
@@ -113,9 +324,7 @@ async def upload_dataset(
 def get_dataset_columns(dataset_id: int):
     """Return registered columns for a dataset as JSON."""
     try:
-        init_db()
-        conn = get_connection()
-        cur = conn.cursor()
+        conn, cur = _init_db_conn()
         cur.execute(
             """
             SELECT id, dataset_id, name, logical_name, data_type, is_value_column, is_candidate_key
@@ -127,6 +336,10 @@ def get_dataset_columns(dataset_id: int):
         rows = cur.fetchall()
         cols = [dict(zip([c[0] for c in cur.description], row)) for row in rows]
     except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to read dataset columns") from exc
     finally:
         try:
@@ -141,9 +354,7 @@ def get_dataset_columns(dataset_id: int):
 def get_mapped_columns(dataset_id: int):
     """Return columns for a dataset that have been mapped (logical_name present)."""
     try:
-        init_db()
-        conn = get_connection()
-        cur = conn.cursor()
+        conn, cur = _init_db_conn()
         cur.execute(
             """
             SELECT id, dataset_id, name, logical_name, data_type, is_value_column, is_candidate_key
@@ -155,6 +366,10 @@ def get_mapped_columns(dataset_id: int):
         rows = cur.fetchall()
         cols = [dict(zip([c[0] for c in cur.description], row)) for row in rows]
     except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to read mapped columns") from exc
     finally:
         try:
@@ -163,6 +378,36 @@ def get_mapped_columns(dataset_id: int):
             pass
 
     return {"dataset_id": dataset_id, "mapped_columns": cols}
+
+
+@router.get("/datasets/{dataset_id}/export")
+def export_dataset_xlsx(dataset_id: int):
+    """Export a dataset back to XLSX using stored `dataset_columns` and header coords.
+
+    Returns the generated XLSX as a file response.
+    """
+    try:
+        conn, cur = _init_db_conn()
+        res = generate_dataset_xlsx(conn, dataset_id)
+        out_path = res.get("path")
+        if not out_path or not os.path.exists(out_path):
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Falha ao gerar arquivo de exportação")
+
+        filename = os.path.basename(out_path)
+        return FileResponse(out_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=filename)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 
@@ -184,9 +429,7 @@ def update_dataset_columns(dataset_id: int, updates: List[ColumnUpdate]):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No updates provided")
 
     try:
-        init_db()
-        conn = get_connection()
-        cur = conn.cursor()
+        conn, cur = _init_db_conn()
         updated_ids = []
         for u in updates:
             # Build parameters and SQL dynamically to update only provided fields
@@ -219,6 +462,10 @@ def update_dataset_columns(dataset_id: int, updates: List[ColumnUpdate]):
     except HTTPException:
         raise
     except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update columns") from exc
     finally:
         try:
@@ -272,14 +519,15 @@ def redetect_headers(
     Returns the refreshed columns.
     """
     try:
-        init_db()
-        conn = get_connection()
-        create_tables(conn)
-        cur = conn.cursor()
+        conn, cur = _init_db_conn()
         # Ensure dataset exists & get path/format
         cur.execute("SELECT storage_path, format FROM datasets WHERE id = ?", (dataset_id,))
         row = cur.fetchone()
         if not row:
+            try:
+                conn.close()
+            except Exception:
+                pass
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset não encontrado")
         storage_path, fmt = row[0], row[1]
 
@@ -340,6 +588,10 @@ def redetect_headers(
     except HTTPException:
         raise
     except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
     finally:
         try:
@@ -363,11 +615,7 @@ def delete_dataset(dataset_id: int):
     - delete the stored original file and the preprocessed CSV under `storage/pre/{id}.csv` if present
     """
     try:
-        init_db()
-        conn = get_connection()
-        create_tables(conn)
-
-        cur = conn.cursor()
+        conn, cur = _init_db_conn()
         # check dataset exists and get storage path
         cur.execute("SELECT storage_path FROM datasets WHERE id = ?", (dataset_id,))
         row = cur.fetchone()
@@ -409,8 +657,7 @@ def delete_dataset(dataset_id: int):
         # delete other dataset-linked records
         cur.execute("DELETE FROM dataset_columns WHERE dataset_id = ?", (dataset_id,))
         cur.execute("DELETE FROM preprocess_runs WHERE dataset_id = ?", (dataset_id,))
-        cur.execute("DELETE FROM reversal_configs WHERE dataset_id = ?", (dataset_id,))
-        cur.execute("DELETE FROM cancellation_configs WHERE dataset_id = ?", (dataset_id,))
+        # Note: `reversal_configs` and `cancellation_configs` are global resources and are not deleted when removing a dataset.
 
         # finally delete dataset record
         cur.execute("DELETE FROM datasets WHERE id = ?", (dataset_id,))
@@ -436,6 +683,10 @@ def delete_dataset(dataset_id: int):
     except HTTPException:
         raise
     except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to delete dataset") from exc
     finally:
         try:

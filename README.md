@@ -1,196 +1,154 @@
-# AL-Tool API (minimal)
+# AL-Tool API — SQL-First Pipeline (documentação resumida)
 
-Breve documentação atualizada cobrindo os fluxos da pipeline, endpoints e como executar/rodar os testes.
+Este repositório implementa uma API e pipeline para conciliação que agora segue o modelo "SQL-first":
 
-**Project Layout**: key folders and files
-- `app/api/`: FastAPI routers (`datasets`, `preprocess`, `reconciliation`, `cancellation`, `reversal`)
-- `app/core/`: `config.py`, `db.py`, `storage.py` (helpers for settings, SQLite and file storage)
-- `app/pipeline/`: pipeline steps and helpers (importer, utils, preprocess flows, reconciliation)
-- `app/repo/`: DB schema (`schema.py`) and repository helpers
-- `tests/`: pytest test suite
 
-**Primary capabilities / flows**
-- **Upload dataset**: `POST /datasets` accepts multipart file uploads. Uploaded file is saved to `settings.STORAGE_PATH` and a `datasets` record is created.
+**Principais pastas**
 
-- **Preprocess dataset (Base B flow)**: `POST /datasets/{id}/preprocess/base-b/run` (and internal `run_preprocess_base_b`)
-  - loads original dataset via `app.pipeline.importer.load_dataset_dataframe`
-  - infers column types (`infer_column_types`) and fills nulls (`fill_nulls`)
-  - applies cancellation marking (`mark_canceled`) using `cancellation_configs`
-  - saves preprocessed CSV to `storage/pre/<dataset_id>.csv` via `save_preprocessed_df`
-  - records a `preprocess_runs` entry with summary
+**Visão geral do novo fluxo**
 
-- **Reversal detection & cancellation support**
-  - reversal detection marks rows with `__is_reversal__` (pipeline helper)
-  - cancellation marking adds `__is_canceled__` (pipeline helper)
-  - `filter_concilable(df)` removes reversal/cancelled rows prior to reconciliation
+1. Upload do arquivo (`POST /datasets`) — salva o arquivo e cria um registro em `datasets`.
+2. Ingestão: o arquivo é lido para um pandas DataFrame apenas na etapa de upload e, em seguida, inserido na tabela `dataset_{id}` via `ingest_dataset_to_sql(conn, dataset_id, df)`.
+3. Pré-processamento SQL:
+   - `fill_nulls_sql(conn, dataset_id, schema_info)` — preenche nulos via UPDATEs SQL.
+   - `mark_canceled_sql(conn, dataset_id, indicator_column, canceled_value)` — marca `__is_canceled__` via SQL.
+   - `detect_and_mark_reversals_sql(conn, dataset_id, colA, colB, value_col)` — detecta e marca reversals via JOIN SQL.
+4. Agregação por chave: `aggregate_by_key_sql(conn, dataset_id, key_columns, value_column)` produz agregados por chave (key → total) usando SQL.
+5. Reconciliação SQL: `run_sql_reconciliation(conn, config_id)` agrega A e B, combina via UNION/GROUP BY (simula FULL OUTER JOIN), aplica inversões quando configurado e classifica cada chave (classificação é feita no código, mas os agregados vêm de SQL). O runner persiste `reconciliation_runs` e `reconciliation_results`.
+6. Exportação final: `generate_reconciliation_xlsx(conn, run_id)` lê `reconciliation_runs` e `reconciliation_results` por SQL, monta DataFrames apenas aqui e escreve `storage/exports/reconciliation_run_{run_id}.xlsx`.
 
-- **Reconciliation configuration**: `POST /reconciliation-configs` stores a config in `reconciliation_configs` and associated `reconciliation_keys`.
-  - A reconciliation config includes `base_a_id`, `base_b_id`, value columns, invert flags and `threshold`.
-  - Each `reconciliation_key` lists `base_a_columns` and `base_b_columns` used to build composite keys.
+**Regras importantes**
+  - Ler o arquivo no momento do upload;
+  - Gerar o arquivo XLSX de exportação no final do fluxo.
 
-- **Run reconciliation**: `POST /reconciliations/configs/{config_id}/run` executes `run_reconciliation`:
-  - loads preprocessed DFs for both bases (`storage/pre/<id>.csv`)
-  - filters concilable rows
-  - generates composite keys (`generate_keys`) and aggregates values (`group_by_key`)
-  - compares keys/values with tolerance (`classify`) and produces per-key results
-  - persists a `reconciliation_runs` record and per-key `reconciliation_results`
-  - returns `run_id`, `summary` and `details`
+**Endpoints (resumo relevante)**
+ - `PUT /datasets/{dataset_id}/config/cancellation` — cria/atualiza a configuração de cancelamento para o dataset; aceita `template_id` ou campos `indicator_column`/`canceled_value`/`active_value`.
+ - `POST /cancellation-templates` — criar/atualizar um template de cancelamento reutilizável.
+ - `GET /cancellation-templates` — listar templates disponíveis.
 
-- **Query results & export**
-  - `GET /reconciliations/results` — list results with filters (`run_id`, `status`, `key_used`, `group_name`) and pagination (`limit`, `offset`).
-  - `GET /reconciliations/runs/{run_id}` — get run metadata + details.
-  - `GET /reconciliations/runs/{run_id}/export` — export run (summary + details) to Excel (`storage/exports/reconciliation_run_{run_id}.xlsx`) and return file.
-  - `merge_results_with_dataframe(dataset_id, run_id)` — pipeline helper to enrich a preprocessed DataFrame with reconciliation results per row.
+**Passo a passo: Como usar a API (exemplo rápido)**
 
-# AL-Tool API (documentação em Português)
+1) Inicie a aplicação (local com `uvicorn` ou via Docker Compose):
 
-Este repositório contém uma implementação mínima da API e da pipeline de conciliação contábil x fiscal.
-
-Objetivo deste README: descrever a estrutura do projeto, os fluxos principais e um passo-a-passo prático de "Como usar a pipeline".
-
-**Estrutura do projeto**
-- `app/api/`: routers FastAPI (`datasets`, `preprocess`, `reconciliation`, `cancellation`, `reversal`)
-- `app/core/`: `config.py`, `db.py`, `storage.py` (configurações, helpers de SQLite e armazenamento de arquivos)
-- `app/pipeline/`: passos da pipeline e helpers (importer, utils, pré-processos, reconciliação)
-- `app/repo/`: esquema do banco de dados (`schema.py`) e helpers de acesso a dados
-- `tests/`: suíte de testes com `pytest`
-
-**Fluxos principais**
-- Upload de dataset: `POST /datasets` — faz upload de arquivo (multipart), salva no `STORAGE_PATH` e cria um registro em `datasets`.
-- Pré-processamento (ex.: Base B): `POST /datasets/{id}/preprocess/base-b/run` — roda o fluxo de pré-processamento e salva `storage/pre/<dataset_id>.csv`.
-- Detecção de reversals e marcação de cancelamentos: a pipeline adiciona flags internas `__is_reversal__` e `__is_canceled__` e o filtro `filter_concilable(df)` remove linhas não conciliáveis.
-- Configuração de reconciliação: `POST /reconciliation-configs` — cria um registro em `reconciliation_configs` e as chaves em `reconciliation_keys`.
-- Execução da reconciliação: `POST /reconciliations/configs/{config_id}/run` — agrega por chave, compara valores com tolerância e persiste `reconciliation_runs` + `reconciliation_results`.
-- Consulta e exportação de resultados: `GET /reconciliations/results`, `GET /reconciliations/runs/{run_id}`, `GET /reconciliations/runs/{run_id}/export`.
-
----
-
-**Como usar a pipeline — passo a passo (guia prático)**
-
-Pré-requisitos
-- Ter Python e dependências instaladas (ver `requirements.txt`).
-- Ter o serviço rodando (localmente via `uvicorn` ou via `docker compose`).
-
-Passo 0 — Iniciar o serviço (opcional local)
 ```bash
-# no diretório do projeto
+# dev
 pip install -r requirements.txt
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+# com Docker
+docker compose up --build -d
 ```
 
-Passo 1 — Fazer upload dos datasets
-- Suba os arquivos das duas bases (Base A e Base B) usando o endpoint `POST /datasets`.
-- Exemplo cURL:
+2) Faça upload de um arquivo para criar um `dataset` (endpoint `POST /datasets`). Exemplo com `curl` (multipart/form-data):
+
 ```bash
 curl -X POST "http://localhost:8000/datasets" \
-  -F "file=@/caminho/para/base_a.csv" \
-  -F "name=base_a" \
-  -F "base_type=A"
-
-curl -X POST "http://localhost:8000/datasets" \
-  -F "file=@/caminho/para/base_b.csv" \
-  -F "name=base_b" \
-  -F "base_type=B"
+  -F "file=@/caminho/para/seu_arquivo.xlsx" \
+  -F "name=meu_dataset_de_teste"
 ```
 
-Anote o `dataset_id` retornado para cada upload (ex.: `id: 1` para Base A e `id: 2` para Base B).
-
-Passo 2 — (Opcional) Visualizar e mapear colunas
-- Use `GET /datasets/{id}/columns` para ver as colunas detectadas.
-- Se necessário, atualize mapeamentos de colunas usando os endpoints do módulo `datasets` (se implementados).
-
-Passo 3 — Rodar pré-processamento (ex.: Base B)
-- Execute o pré-processo específico (Base B) para normalizar colunas, preencher nulos, marcar cancelamentos/reversals e gerar o CSV pré-processado:
-```bash
-POST http://localhost:8000/datasets/{base_b_id}/preprocess/base-b/run
-```
-
-- Exemplo cURL:
-```bash
-curl -X POST "http://localhost:8000/datasets/2/preprocess/base-b/run"
-```
-
-- Saída esperada: arquivo salvo em `storage/pre/<dataset_id>.csv` e um registro em `preprocess_runs` com resumo.
-
-Passo 4 — Criar configuração de reconciliação
-- Crie uma `reconciliation_config` que aponta para `base_a_id` e `base_b_id`, define colunas de valor, sinal de inversão (invert), tolerância (`threshold`) e lista de chaves (cada chave relaciona colunas de A com colunas de B).
-- Exemplo de payload JSON:
+Resposta esperada (JSON):
 ```json
 {
-  "name": "Reconciliação Exemplo",
-  "base_a_id": 1,
-  "base_b_id": 2,
-  "value_a_column": "valor_a",
-  "value_b_column": "valor_b",
-  "invert_b": false,
-  "threshold": 0.01,
-  "keys": [
-    {"base_a_columns": ["cnpj", "nota"], "base_b_columns": ["cnpj_emitente", "numero_nota"], "group_name": "por_nota"}
-  ]
+  "dataset_id": 42,
+  "filename": "seu_arquivo.xlsx",
+  "rows": 1234
 }
 ```
 
-Use o endpoint `POST /reconciliation-configs` para criar a configuração e anote o `config_id` retornado.
+3) (Opcional) Crie uma configuração de cancelamento ou execute pré-processos SQL via endpoints específicos (se disponíveis). Caso queira criar a configuração de reconciliação, poste em `POST /reconciliation-configs` com payload JSON:
 
-Passo 5 — Executar a reconciliação
-- Com `config_id` criado, execute:
 ```bash
-POST http://localhost:8000/reconciliations/configs/{config_id}/run
+curl -X POST "http://localhost:8000/reconciliation-configs" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Minha conciliação teste",
+    "base_a_id": 42,
+    "base_b_id": 43,
+    "value_column_a": "amount",
+    "value_column_b": "amount",
+    "invert_a": 0,
+    "invert_b": 0,
+    "threshold": 0.01,
+    "keys": [
+      {"name": "key1", "base_a_columns": ["col1","col2"], "base_b_columns": ["col1","col2"]}
+    ]
+  }'
 ```
 
-Exemplo cURL:
+Resposta esperada (JSON): `{"reconciliation_config_id": 1, "reconciliation_keys": [...]}`
+
+4) Dispare a reconciliação SQL-first: `POST /reconciliations/configs/{config_id}/run`.
+
 ```bash
 curl -X POST "http://localhost:8000/reconciliations/configs/1/run"
 ```
 
-- Resultado: a API cria um registro em `reconciliation_runs` e insere resultados por chave em `reconciliation_results`. A resposta inclui `run_id`, resumo (`matched`, `missing_a`, `missing_b`, etc.) e detalhes por chave.
-
-Passo 6 — Consultar resultados
-- Listar resultados com filtros (status, run_id, group_name):
-```bash
-GET /reconciliations/results?run_id={run_id}&status=missing_a&limit=100&offset=0
+Resposta esperada (JSON) com o sumário do run:
+```json
+{ "run": { "run_id": 7, "status": "finished", "summary": { ... } } }
 ```
 
-- Obter resumo e detalhes do run:
+5) Baixe o Excel gerado para o run: `GET /reconciliations/runs/{run_id}/export`.
+
 ```bash
-GET /reconciliations/runs/{run_id}
+curl -L -o reconciliation_run_7.xlsx "http://localhost:8000/reconciliations/runs/7/export"
 ```
 
-Passo 7 — Exportar resultados
-- Baixe um Excel com resumo+detalhes do run:
-```bash
-GET /reconciliations/runs/{run_id}/export
+Obs.: os arquivos XLSX gerados são salvos em `storage/exports/` (ou conforme `settings.STORAGE_PATH`).
+
+6) Consultas e inspeção:
+
+
+Se quiser que eu acrescente exemplos em `httpie` ou snippets para Postman/Insomnia, ou ainda scripts automatizados em `scripts/`, eu adiciono em seguida.
+
+**Trechos de uso (exemplos rápidos)**
+
+Ingestão (exemplo em Python — chamado no upload):
+```python
+import sqlite3
+from app.repo.datasets import ingest_dataset_to_sql
+
+conn = sqlite3.connect('data/app.db')
+# df: pandas DataFrame carregado do Excel/CSV/TXT durante upload
+res = ingest_dataset_to_sql(conn, dataset_id=42, df=df)
+print(res)  # {'dataset_id': 42, 'rows': N}
 ```
 
-O arquivo é salvo em `storage/exports/reconciliation_run_{run_id}.xlsx` e retornado como download.
+Rodar reconciliação SQL (exemplo):
+```python
+from app.pipeline.reconciliation import run_sql_reconciliation
+conn = sqlite3.connect('data/app.db')
+out = run_sql_reconciliation(conn, config_id=1)
+print(out['summary'])
+```
 
-Passo 8 — (Opcional) Enriquecer dataset com resultados
-- Use `merge_results_with_dataframe(dataset_id, run_id)` (helper de pipeline) para anexar colunas de status e diferença ao DataFrame pré-processado.
+Exportar XLSX (após run):
+```python
+from app.pipeline.exporter import generate_reconciliation_xlsx
+conn = sqlite3.connect('data/app.db')
+res = generate_reconciliation_xlsx(conn, run_id=1)
+print(res['path'])
+```
 
----
+**Comandos úteis**
 
-**Boas práticas e observações**
-- Sempre pré-processe as bases antes de rodar a reconciliação (arquivo `storage/pre/<id>.csv`).
-- Verifique as flags `__is_reversal__` e `__is_canceled__` se precisar auditar por linha.
-- Ajuste `threshold` conforme a precisão desejada (valor absoluto ou percentual conforme implementação do `classify`).
-- Para produção, recomendo:
-  - Adicionar índices e chaves estrangeiras no schema do banco.
-  - Usar transações para gravações em lote.
-  - Validar payloads com Pydantic nos endpoints.
-
-**Comandos rápidos**
-- Iniciar local (uvicorn):
+Start local (dev):
 ```bash
 pip install -r requirements.txt
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-- Rodar testes:
+Start with Docker Compose:
 ```bash
-pip install -r requirements.txt
+docker compose up -d
+```
+
+Run tests:
+```bash
 pytest -q
 ```
 
----
+**Notas de migração e compatibilidade**
 
-Se quiser, eu adiciono exemplos cURL completos para cada endpoint e um pequeno script de exemplo (`scripts/run_example.sh`) que automatiza os passos descritos (upload → preprocess → create config → run → export). Basta dizer qual opção prefere.
+Se quiser que eu atualize exemplos cURL, scripts de demonstração em `scripts/` ou adicione documentação de operações SQL (ex.: índices recomendados), diga qual parte prefere que eu documente a seguir.

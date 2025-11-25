@@ -29,7 +29,7 @@ def _col_letter_to_index(letter: str) -> int:
 
 
 def save_detected_columns(
-    conn: sqlite3.Connection | Any,
+    conn: Any,
     dataset_id: int,
     df: pd.DataFrame,
     col_types: Dict[str, str],
@@ -201,7 +201,7 @@ def save_detected_columns(
     return inserted_ids
 
 
-def get_dataset_headers(conn: sqlite3.Connection | Any, dataset_id: int) -> List[str]:
+def get_dataset_headers(conn: Any, dataset_id: int) -> List[str]:
     """Return ordered header names for a dataset from `dataset_columns`.
 
     Prefers `logical_name` when present and non-empty, otherwise falls back to

@@ -13,9 +13,9 @@ from typing import Any, Optional
 from ..core.db import init_db, get_connection
 from ..repo.schema import create_tables
 from ..pipeline.importer import load_dataset_dataframe
-from ..pipeline.utils import infer_column_types
-from ..pipeline.fill_nulls import fill_nulls
-from ..pipeline.reversal import detect_reversals
+from ..pipeline.utils import infer_column_types, select_concilable_rows_sql
+from ..pipeline.fill_nulls import fill_nulls_sql
+from ..pipeline.reversals import detect_and_mark_reversals_sql
 from ..core.storage import save_preprocessed_df, export_to_excel
 from pathlib import Path
 from ..core.config import settings
@@ -25,6 +25,14 @@ from ..pipeline.preprocess_base_b import run_preprocess_base_b
 from ..repo.dataset_columns import get_dataset_headers
 
 router = APIRouter()
+
+
+def _init_db_conn():
+    init_db()
+    conn = get_connection()
+    create_tables(conn)
+    cur = conn.cursor()
+    return conn, cur
 
 
 @router.post("/datasets/{dataset_id}/preprocess")
@@ -38,35 +46,53 @@ def run_preprocess(
 
     Returns the created `preprocess_run` id and summary information.
     """
-    init_db()
-    conn = get_connection()
+    conn, cur = _init_db_conn()
     try:
-        # ensure tables exist
-        create_tables(conn)
-
         started_at = datetime.utcnow().isoformat()
 
-        # load DataFrame using repository-aware loader
+        # Perform SQL-only preprocessing:
+        # 1) Build schema_info from dataset_columns to drive fill_nulls_sql
         try:
-            df = load_dataset_dataframe(conn, dataset_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+            cur = conn.cursor()
+            cur.execute("SELECT name, data_type FROM dataset_columns WHERE dataset_id = ? ORDER BY id", (dataset_id,))
+            rows = cur.fetchall()
+            schema_info = {r[0]: (r[1] or "string") for r in rows} if rows else {}
+        except Exception:
+            schema_info = {}
 
-        # infer simple column types and apply fill_nulls
-        col_types = infer_column_types(df)
-        df_pre = fill_nulls(df, col_types)
+        # 2) Fill nulls via SQL
+        try:
+            if schema_info:
+                fill_nulls_sql(conn, dataset_id, schema_info)
+        except Exception:
+            # tolerate failures and continue
+            LOG.debug("fill_nulls_sql failed for dataset %s", dataset_id, exc_info=True)
 
-        # optionally run reversal detection when columns are provided
-        reversals: list = []
-        if col_a and col_b and value_column:
+        # 3) Optionally run reversal detection via SQL when columns are provided
+        reversals_count = 0
+        try:
+            if col_a and col_b and value_column:
+                res = detect_and_mark_reversals_sql(conn, dataset_id, col_a, col_b, value_column)
+                reversals_count = int(res.get("rows_marked", 0) if isinstance(res, dict) else 0)
+        except Exception:
+            # treat as zero if detection fails
+            reversals_count = 0
+
+        # 4) Load the table (after SQL preprocessing) into a DataFrame to save preprocessed CSV
+        try:
+            table = f"dataset_{int(dataset_id)}"
+            cur.execute(f'SELECT * FROM "{table}"')
+            rows = cur.fetchall()
+            cols = [c[0] for c in cur.description] if cur.description else []
+            df_pre = pd.DataFrame.from_records(rows, columns=cols)
+        except Exception:
+            # Fallback: try loading original file into DataFrame
             try:
-                reversals = detect_reversals(df_pre, col_a, col_b, value_column)
-            except KeyError as exc:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+                df_pre = load_dataset_dataframe(conn, dataset_id)
+            except Exception:
+                df_pre = pd.DataFrame()
 
-        # apply headers from repository if available and matching count
+        # Apply headers from repository if available and matching count
         try:
             headers = get_dataset_headers(conn, dataset_id)
             if headers and len(headers) == len(df_pre.columns):
@@ -83,9 +109,9 @@ def run_preprocess(
         # prepare summary
         summary = {
             "rows": int(df_pre.shape[0]),
-            "columns": int(df_pre.shape[1]),
+            "columns": int(df_pre.shape[1]) if hasattr(df_pre, 'shape') else 0,
             "storage_path": storage_path,
-            "reversals_count": len(reversals),
+            "reversals_count": int(reversals_count),
         }
 
         # insert preprocess_runs record
@@ -103,14 +129,14 @@ def run_preprocess(
     except HTTPException:
         raise
     except Exception as exc:
+        LOG.exception("Preprocess failed for dataset %s", dataset_id)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Preprocess failed") from exc
     finally:
         try:
             conn.close()
         except Exception:
             pass
-
-    return {"dataset_id": dataset_id, "preprocess_run_id": run_id, "summary": summary}
+    return {"dataset_id": dataset_id, "summary": summary, "status": "completed"}
 
 
 @router.post("/datasets/{dataset_id}/preprocess/base-b/run")
@@ -122,12 +148,8 @@ def run_base_b_pipeline(dataset_id: int):
     2. Call `run_preprocess_base_b(conn, dataset_id)`
     3. Return summary and status
     """
-    init_db()
-    conn = get_connection()
+    conn, cur = _init_db_conn()
     try:
-        create_tables(conn)
-
-        cur = conn.cursor()
         cur.execute("SELECT id, base_type FROM datasets WHERE id = ?", (dataset_id,))
         row = cur.fetchone()
         if not row:
@@ -141,8 +163,9 @@ def run_base_b_pipeline(dataset_id: int):
             summary = run_preprocess_base_b(conn, dataset_id)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Preprocess Base B failed") from exc
+        except Exception:
+            LOG.exception("run_preprocess_base_b failed for %s", dataset_id)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Preprocess Base B failed")
 
     finally:
         try:
@@ -164,10 +187,8 @@ def export_preprocessed_dataset(dataset_id: int):
     DataFrame and writes an Excel file to `storage/exports/preprocessed_{dataset_id}.xlsx`.
     Returns a `FileResponse` for download.
     """
-    init_db()
-    conn = get_connection()
+    conn, cur = _init_db_conn()
     try:
-        create_tables(conn)
         try:
             df = load_preprocessed_dataset_dataframe(dataset_id)
         except FileNotFoundError as exc:

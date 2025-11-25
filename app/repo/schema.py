@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS reconciliation_runs (
 REVERSAL_CONFIGS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS reversal_configs (
     id INTEGER PRIMARY KEY,
-    dataset_id INTEGER,
+    name TEXT,
     column_a TEXT,
     column_b TEXT,
     value_column TEXT
@@ -113,16 +113,15 @@ CREATE TABLE IF NOT EXISTS reversal_configs (
 CANCELLATION_CONFIGS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS cancellation_configs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    dataset_id INTEGER NOT NULL,
-    indicator_column TEXT NOT NULL,
-    canceled_value TEXT NOT NULL,
-    active_value TEXT NOT NULL,
-    UNIQUE(dataset_id)
+    name TEXT,
+    indicator_column TEXT,
+    canceled_value TEXT,
+    active_value TEXT
 );
 """
 
 
-def create_tables(conn: sqlite3.Connection | Any) -> None:
+def create_tables(conn: Any) -> None:
     """Create required tables on the given SQLite connection.
 
     The function will execute DDL statements and commit the transaction.
@@ -148,6 +147,7 @@ def create_tables(conn: sqlite3.Connection | Any) -> None:
             alters.append("ALTER TABLE datasets ADD COLUMN header_row INTEGER")
         if "header_col" not in existing_cols:
             alters.append("ALTER TABLE datasets ADD COLUMN header_col TEXT")
+        # No template migration required (templates removed)
         for stmt in alters:
             cur.execute(stmt)
         if alters:

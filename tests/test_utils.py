@@ -49,12 +49,12 @@ def test_group_by_key_and_classify():
     totals = group_by_key(df, df["key"], "amt")
     assert totals["A"] == 12.0 and totals["B"] == 5.0
 
-    # classification
-    assert classify(0, 0)[0] == "both_zero"
-    assert classify(100, 99, threshold=1)[0] == "match"
-    assert classify(5, 0)[0] == "only_a"
-    assert classify(0, 3)[0] == "only_b"
-    assert classify(5, 3)[0] == "mismatch"
+    # classification (pt-BR)
+    assert classify(0, 0)[0] == "Ambos zero"
+    assert classify(100, 99, threshold=1)[0] == "Conferem"
+    assert classify(5, 0)[0] == "Apenas A"
+    assert classify(0, 3)[0] == "Apenas B"
+    assert classify(5, 3)[0] == "Divergência"
 
 
 def test_find_missing_and_attach_results():
@@ -64,8 +64,8 @@ def test_find_missing_and_attach_results():
     assert onlyA == ["k1"] and onlyB == ["k3"]
 
     df = pd.DataFrame({"k": ["k1", "k2", "k3"], "v": [1, 2, 3]})
-    mapping = {"k1": ("match", "matched", 0.0), "k3": {"status": "only_a", "group": "unmatched", "difference": 3.0}}
+    mapping = {"k1": ("Conferem", "Conciliados", 0.0), "k3": {"status": "Apenas A", "group": "Não conciliados", "difference": 3.0}}
     out = attach_results(df, mapping, key_column="k", status_col="st", group_col="grp", diff_col="diff")
     assert "st" in out.columns and "grp" in out.columns and "diff" in out.columns
-    assert out.loc[0, "st"] == "match"
-    assert out.loc[2, "st"] == "only_a"
+    assert out.loc[0, "st"] == "Conferem"
+    assert out.loc[2, "st"] == "Apenas A"

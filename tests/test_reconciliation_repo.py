@@ -15,8 +15,8 @@ def test_save_and_query_results(tmp_path, monkeypatch):
         schema.create_tables(conn)
         run_id = 1
         results = [
-            {"row_identifier": "k1", "status": "match", "group": "matched", "key_name": "keyA", "difference": 0.0},
-            {"row_identifier": "k2", "status": "only_a", "group": "unmatched", "key_name": "keyA", "difference": 10.0},
+            {"row_identifier": "k1", "status": "Conferem", "group": "Conciliados", "key_name": "keyA", "difference": 0.0},
+            {"row_identifier": "k2", "status": "Apenas A", "group": "Não conciliados", "key_name": "keyA", "difference": 10.0},
         ]
         ids = save_reconciliation_results(conn, run_id, results)
         assert len(ids) == 2
